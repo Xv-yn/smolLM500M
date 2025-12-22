@@ -8,6 +8,8 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 
 def pack_ids(list_of_id_lists, seq_len: int, eos_id: int | None):
     """
