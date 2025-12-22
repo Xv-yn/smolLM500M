@@ -2,7 +2,9 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 tok = AutoTokenizer.from_pretrained(
-    "./runs/poc_from_text/ckpt-step-500", trust_remote_code=True
+    "./runs/poc_from_text/ckpt-step-500",
+    trust_remote_code=True,
+    fix_mistral_regex=True,
 )
 model = AutoModelForCausalLM.from_pretrained(
     "./runs/poc_from_text/ckpt-step-500",
