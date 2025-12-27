@@ -82,27 +82,18 @@ class ParquetPackedIterable(IterableDataset):
                         continue
 
                     input_ids = torch.tensor(ids, dtype=torch.long)
-
-                    labels = input_ids.clone()
-                    labels[labels == tokenizer.pad_token_id] = (
-                        -100
-                    )  # ignore pad/eos in loss
-
                     yield {
                         "input_ids": input_ids,
-                        "labels": labels,
+                        "labels": input_ids,
                         "attention_mask": torch.ones_like(input_ids),
                     }
 
 
 def collate_packed(examples):
+    # Examples already contain tensors of shape [seq_len]; just stack.
     input_ids = torch.stack([ex["input_ids"] for ex in examples], dim=0)
+    labels = torch.stack([ex["labels"] for ex in examples], dim=0)
     attention_mask = torch.stack([ex["attention_mask"] for ex in examples], dim=0)
-
-    labels = input_ids.clone()
-    # We'll set tokenizer.pad_token_id later by closure or global; see below
-    labels[labels == PAD_ID] = -100
-
     return {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
 
 
@@ -138,9 +129,6 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    global PAD_ID
-    PAD_ID = tokenizer.pad_token_id
-
     if accelerator.is_main_process:
         print("\n=== Token IDs ===")
         print("tokenizer.bos_token_id:", tokenizer.bos_token_id)
@@ -154,9 +142,6 @@ def main():
     config = AutoConfig.from_pretrained(args.model_dir, trust_remote_code=True)
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
 
-    if accelerator.is_main_process:
-        print("model vocab_size:", model.config.vocab_size)
-        print("tokenizer vocab_size:", len(tokenizer))
     # --- load packed parquet shards
     packed = ParquetPackedIterable(
         args.packed_dir, args.seq_len, args.shuffle, args.seed
@@ -177,7 +162,7 @@ def main():
         model.parameters(),
         lr=args.learning_rate,
         betas=(0.9, 0.95),
-        eps=1e-6,
+        eps=1e-8,
         weight_decay=args.weight_decay,
     )
 
@@ -204,43 +189,17 @@ def main():
         except StopIteration:
             data_iter = iter(train_loader)
             batch = next(data_iter)
-        # DEBUG: check token id range before forward
-        vocab = model.config.vocab_size
-        ids = batch["input_ids"]
-        if (ids < 0).any() or (ids >= vocab).any():
-            print("vocab_size:", vocab)
-            print("min token:", ids.min().item())
-            print("max token:", ids.max().item())
-            # optionally print a few offending values
-            bad = ids[(ids < 0) | (ids >= vocab)]
-            print("some bad ids:", bad[:20].tolist())
-            raise RuntimeError("Found out-of-range token id")
 
         with accelerator.accumulate(model):
-            outputs = model(**batch)
-            loss = outputs.loss
+            loss = model(**batch).loss
             accelerator.backward(loss)
 
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                if accelerator.is_main_process:
-                    bad_params = []
-                    for n, p in model.named_parameters():
-                        if (
-                            p is not None
-                            and p.data is not None
-                            and (torch.isnan(p.data).any() or torch.isinf(p.data).any())
-                        ):
-                            bad_params.append(n)
-                            break
-                    if bad_params:
-                        raise RuntimeError(
-                            f"NaN/Inf appeared in params after step {step}: {bad_params[0]}"
-                        )
 
-                lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
 
         if accelerator.is_main_process and step % args.log_every == 0:
             lr = lr_scheduler.get_last_lr()[0]
