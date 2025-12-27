@@ -82,18 +82,27 @@ class ParquetPackedIterable(IterableDataset):
                         continue
 
                     input_ids = torch.tensor(ids, dtype=torch.long)
+
+                    labels = input_ids.clone()
+                    labels[labels == tokenizer.pad_token_id] = (
+                        -100
+                    )  # ignore pad/eos in loss
+
                     yield {
                         "input_ids": input_ids,
-                        "labels": input_ids,
+                        "labels": labels,
                         "attention_mask": torch.ones_like(input_ids),
                     }
 
 
 def collate_packed(examples):
-    # Examples already contain tensors of shape [seq_len]; just stack.
     input_ids = torch.stack([ex["input_ids"] for ex in examples], dim=0)
-    labels = torch.stack([ex["labels"] for ex in examples], dim=0)
     attention_mask = torch.stack([ex["attention_mask"] for ex in examples], dim=0)
+
+    labels = input_ids.clone()
+    # We'll set tokenizer.pad_token_id later by closure or global; see below
+    labels[labels == PAD_ID] = -100
+
     return {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
 
 
@@ -128,6 +137,9 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    global PAD_ID
+    PAD_ID = tokenizer.pad_token_id
 
     if accelerator.is_main_process:
         print("\n=== Token IDs ===")
