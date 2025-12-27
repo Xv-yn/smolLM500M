@@ -201,6 +201,19 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
+                if accelerator.is_main_process and step <= 16:
+                    unwrapped = accelerator.unwrap_model(model)
+                    bad = False
+                    for n, p in unwrapped.named_parameters():
+                        if p.requires_grad and not torch.isfinite(p).all():
+                            print("Non-finite param after opt step:", n)
+                            bad = True
+                            break
+                    if bad:
+                        raise RuntimeError(
+                            "Weights became non-finite right after optimizer step."
+                        )
+
         if step == 1 and accelerator.is_main_process:
             print(
                 "input_ids min/max:",
