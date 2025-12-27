@@ -22,6 +22,7 @@ Notes:
 import argparse
 import glob
 import os
+import random
 
 import pyarrow.parquet as pq
 import torch
@@ -200,6 +201,28 @@ def main():
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
+
+        if step == 1 and accelerator.is_main_process:
+            print(
+                "input_ids min/max:",
+                batch["input_ids"].min().item(),
+                batch["input_ids"].max().item(),
+            )
+            print(
+                "labels min/max:",
+                batch["labels"].min().item(),
+                batch["labels"].max().item(),
+            )
+            print(
+                "any NaN in input?",
+                torch.isnan(batch["input_ids"].float()).any().item(),
+            )
+            print(
+                "any NaN in labels?", torch.isnan(batch["labels"].float()).any().item()
+            )
+
+        if step == 1 and accelerator.is_main_process:
+            print("config.vocab_size:", model.config.vocab_size)
 
         if accelerator.is_main_process and step % args.log_every == 0:
             lr = lr_scheduler.get_last_lr()[0]
