@@ -142,6 +142,9 @@ def main():
     config = AutoConfig.from_pretrained(args.model_dir, trust_remote_code=True)
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
 
+    if accelerator.is_main_process:
+        print("model vocab_size:", model.config.vocab_size)
+        print("tokenizer vocab_size:", len(tokenizer))
     # --- load packed parquet shards
     packed = ParquetPackedIterable(
         args.packed_dir, args.seq_len, args.shuffle, args.seed
@@ -189,6 +192,17 @@ def main():
         except StopIteration:
             data_iter = iter(train_loader)
             batch = next(data_iter)
+        # DEBUG: check token id range before forward
+        vocab = model.config.vocab_size
+        ids = batch["input_ids"]
+        if (ids < 0).any() or (ids >= vocab).any():
+            print("vocab_size:", vocab)
+            print("min token:", ids.min().item())
+            print("max token:", ids.max().item())
+            # optionally print a few offending values
+            bad = ids[(ids < 0) | (ids >= vocab)]
+            print("some bad ids:", bad[:20].tolist())
+            raise RuntimeError("Found out-of-range token id")
 
         with accelerator.accumulate(model):
             outputs = model(**batch)
