@@ -26,7 +26,7 @@ import os
 import pyarrow.parquet as pq
 import torch
 from accelerate import Accelerator
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, IterableDataset
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
