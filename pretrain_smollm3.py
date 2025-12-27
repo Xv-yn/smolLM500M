@@ -1,23 +1,3 @@
-"""
-accelerate launch --num_processes 1 pretrain_smollm3.py \
-  --model_dir . \
-  --packed_dir ./packed/seq4096 \
-  --output_dir ./runs/full_20B_1epoch \
-  --seq_len 4096 \
-  --micro_batch_size 4 \
-  --grad_accum_steps 2 \
-  --learning_rate 1e-4 \
-  --weight_decay 0.01 \
-  --num_train_steps 610352 \
-  --warmup_steps 2000 \
-  --log_every 10 \
-  --save_every 50000 \
-  --num_workers 0 \
-  --mixed_precision bf16 \
-  --attn_impl sdpa
-
-"""
-
 import argparse
 import glob
 import os
@@ -246,6 +226,10 @@ def main():
     model.train()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # IMPORTANT: after prepare(), model may be DDP-wrapped and won't expose .config
+    base_model = accelerator.unwrap_model(model)
+    vocab_size = base_model.config.vocab_size
+
     # ---- training loop
     data_iter = iter(train_loader)
 
@@ -269,12 +253,11 @@ def main():
 
         micro_step += 1
 
-        # token id sanity
-        vocab = model.config.vocab_size
+        # token id sanity (DDP-safe)
         ids = batch["input_ids"]
-        if (ids < 0).any() or (ids >= vocab).any():
+        if ids.min().item() < 0 or ids.max().item() >= vocab_size:
             if accelerator.is_main_process:
-                print("vocab_size:", vocab)
+                print("vocab_size:", vocab_size)
                 print("min token:", ids.min().item())
                 print("max token:", ids.max().item())
             raise RuntimeError("Found out-of-range token id")
