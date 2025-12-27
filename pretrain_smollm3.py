@@ -122,7 +122,11 @@ def main():
     ap.add_argument("--shuffle", action="store_true", help="Shuffle packed blocks.")
     args = ap.parse_args()
 
-    accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum_steps)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.grad_accum_steps,
+        mixed_precision="bf16",
+    )
+
     torch.manual_seed(args.seed)
 
     # --- tokenizer (only needed for saving + generation utils)
@@ -142,6 +146,8 @@ def main():
     # --- model
     config = AutoConfig.from_pretrained(args.model_dir, trust_remote_code=True)
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+
+    model = model.to(torch.float32)
 
     # --- load packed parquet shards
     packed = ParquetPackedIterable(
@@ -163,8 +169,8 @@ def main():
         model.parameters(),
         lr=args.learning_rate,
         betas=(0.9, 0.95),
-        eps=1e-8,
-        weight_decay=args.weight_decay,
+        eps=1e-6,  # was 1e-8
+        weight_decay=0.0,  # TEMP test (add back later)
     )
 
     # --- scheduler
