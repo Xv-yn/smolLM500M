@@ -190,17 +190,16 @@ def main():
         except StopIteration:
             data_iter = iter(train_loader)
             batch = next(data_iter)
-
         with accelerator.accumulate(model):
-            loss = model(**batch).loss
+            outputs = model(**batch)
+            loss = outputs.loss
             accelerator.backward(loss)
 
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(model.parameters(), 1.0)
-
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad()
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
 
         if step == 1 and accelerator.is_main_process:
             print(
