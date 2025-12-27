@@ -3,8 +3,7 @@ export SOURCES='[
   {"name":"fineweb_edu","dataset":"HuggingFaceFW/fineweb-edu","config":null,"text_col":"text","weight":0.88,"token_cap":17600000000},
   {"name":"dclm","dataset":"mlfoundations/dclm-baseline-1.0","config":null,"text_col":"text","weight":0.07,"token_cap":1400000000},
   {"name":"stackexchange","dataset":"allenai/dolmino-mix-1124","config":"stackexchange","text_col":"text","weight":0.03,"token_cap":600000000},
-  {"name":"wiki","dataset":"allenai/dolmino-mix-1124","config":"wiki","text_col":"text","weight":0.01,"token_cap":200000000},
-  {"name":"code","dataset":"bigcode/the-stack-v2","config":"Python","text_col":"content","weight":0.01,"token_cap":200000000}
+  {"name":"wiki","dataset":"allenai/dolmino-mix-1124","config":"wiki","text_col":"text","weight":0.01,"token_cap":200000000}
 ]'
 
 
@@ -144,7 +143,14 @@ def main():
         total_tokens_written = state["total_tokens_written"]
         per_source_tokens = state["per_source_tokens"]
         carry = state["carry"]  # leftover tokens buffer
-        rng.setstate(tuple(state["rng_state"]))
+
+        def to_tuple(x):
+            if isinstance(x, list):
+                return tuple(to_tuple(i) for i in x)
+            return x
+
+        rng.setstate(to_tuple(state["rng_state"]))
+
         print(f"[resume] shard_idx={shard_idx} total_tokens={total_tokens_written}")
     else:
         shard_idx = 0
@@ -223,9 +229,8 @@ def main():
 
     def save_state():
         # random.getstate() is tuple of tuples; convert recursively to lists for JSON
-        import random as _random
 
-        st = _random.getstate()
+        st = rng.getstate()
 
         def to_list(x):
             if isinstance(x, tuple):
@@ -233,6 +238,7 @@ def main():
             return x
 
         rng_state_list = to_list(st)
+
         atomic_write_json(
             state_path,
             {
