@@ -162,7 +162,7 @@ def main():
         model.parameters(),
         lr=args.learning_rate,
         betas=(0.9, 0.95),
-        eps=1e-8,
+        eps=1e-6,
         weight_decay=args.weight_decay,
     )
 
@@ -191,15 +191,30 @@ def main():
             batch = next(data_iter)
 
         with accelerator.accumulate(model):
-            loss = model(**batch).loss
+            outputs = model(**batch)
+            loss = outputs.loss
             accelerator.backward(loss)
 
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                if accelerator.is_main_process:
+                    bad_params = []
+                    for n, p in model.named_parameters():
+                        if (
+                            p is not None
+                            and p.data is not None
+                            and (torch.isnan(p.data).any() or torch.isinf(p.data).any())
+                        ):
+                            bad_params.append(n)
+                            break
+                    if bad_params:
+                        raise RuntimeError(
+                            f"NaN/Inf appeared in params after step {step}: {bad_params[0]}"
+                        )
 
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad()
+                lr_scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
 
         if accelerator.is_main_process and step % args.log_every == 0:
             lr = lr_scheduler.get_last_lr()[0]
