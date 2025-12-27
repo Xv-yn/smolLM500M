@@ -22,72 +22,103 @@ Notes:
 import argparse
 import glob
 import os
-import random
 
 import pyarrow.parquet as pq
 import torch
 from accelerate import Accelerator
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader, Dataset
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-class ParquetPackedIterable(IterableDataset):
-    def __init__(self, packed_dir: str, seq_len: int, shuffle_shards: bool, seed: int):
-        super().__init__()
+class ParquetPackedDataset(Dataset):
+    """
+    Reads shard-*.parquet produced by build_packed_shards.py.
+
+    Each row contains:
+      - input_ids: list[int] of length seq_len
+      - source: string (ignored for training)
+
+    We create:
+      - labels = input_ids (causal LM)
+      - attention_mask = ones
+    """
+
+    def __init__(self, packed_dir: str, seq_len: int, validate_first_n: int = 8):
         self.packed_dir = packed_dir
         self.seq_len = seq_len
-        self.shuffle_shards = shuffle_shards
-        self.seed = seed
 
         self.files = sorted(glob.glob(os.path.join(packed_dir, "shard-*.parquet")))
         if not self.files:
-            raise FileNotFoundError(f"No shard-*.parquet in {packed_dir}")
+            raise FileNotFoundError(
+                f"No shard-*.parquet found in {packed_dir}. "
+                "Point --packed_dir at the folder created by build_packed_shards.py."
+            )
 
-    def __iter__(self):
-        # DDP info (works with Accelerate too)
-        try:
-            import torch.distributed as dist
+        # Build a global row index: map [0..N) to (file_idx, row_idx)
+        self._file_row_counts = []
+        self._cum_rows = []
+        total = 0
+        for f in self.files:
+            pf = pq.ParquetFile(f)
+            n = pf.metadata.num_rows
+            self._file_row_counts.append(n)
+            total += n
+            self._cum_rows.append(total)
+        self._total_rows = total
 
-            if dist.is_available() and dist.is_initialized():
-                rank = dist.get_rank()
-                world = dist.get_world_size()
-            else:
-                rank, world = 0, 1
-        except Exception:
-            rank, world = 0, 1
+        # Optional quick sanity check: validate a few rows from the first shard
+        # (fast fail if wrong seq_len)
+        if validate_first_n > 0:
+            table = pq.read_table(self.files[0], columns=["input_ids"])
+            ncheck = min(validate_first_n, table.num_rows)
+            for i in range(ncheck):
+                ids = table["input_ids"][i].as_py()
+                if len(ids) != self.seq_len:
+                    raise ValueError(
+                        f"Packed shard seq_len mismatch in {self.files[0]} row {i}. "
+                        f"Expected {self.seq_len}, got {len(ids)}. "
+                        "Launch with matching --seq_len or rebuild shards."
+                    )
 
-        files = self.files[:]
+    def __len__(self):
+        return self._total_rows
 
-        # Cheap shuffle: shuffle shard order, not rows
-        if self.shuffle_shards:
-            rng = random.Random(self.seed + rank)
-            rng.shuffle(files)
+    def _locate(self, idx: int):
+        # Find which file contains this global row index
+        import bisect
 
-        # Split shards across ranks (rank 0 gets files 0, world, 2world...)
-        files = files[rank::world]
+        file_i = bisect.bisect_right(self._cum_rows, idx)
+        prev = 0 if file_i == 0 else self._cum_rows[file_i - 1]
+        row_i = idx - prev
+        return file_i, row_i
 
-        for path in files:
-            pf = pq.ParquetFile(path)
+    def __getitem__(self, idx: int):
+        file_i, row_i = self._locate(idx)
+        f = self.files[file_i]
 
-            # Iterate row groups sequentially
-            for rg in range(pf.num_row_groups):
-                table = pf.read_row_group(rg, columns=["input_ids"])
-                col = table["input_ids"]
+        # NOTE: simplest correct approach: read the column and index the row.
+        # For smoke tests this is fine. For high throughput, optimize by caching
+        # row-groups or memory-mapping (can be done later).
+        table = pq.read_table(f, columns=["input_ids"])
+        ids = table["input_ids"][row_i].as_py()
 
-                # Iterate rows sequentially
-                for i in range(table.num_rows):
-                    ids = col[i].as_py()
-                    if len(ids) != self.seq_len:
-                        continue
+        if len(ids) != self.seq_len:
+            raise ValueError(
+                f"Packed shard seq_len mismatch in {f} row {row_i}. "
+                f"Expected {self.seq_len}, got {len(ids)}."
+            )
 
-                    input_ids = torch.tensor(ids, dtype=torch.long)
-                    yield {
-                        "input_ids": input_ids,
-                        "labels": input_ids,
-                        "attention_mask": torch.ones_like(input_ids),
-                    }
+        input_ids = torch.tensor(ids, dtype=torch.long)
+        labels = input_ids.clone()
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attention_mask,
+        }
 
 
 def collate_packed(examples):
@@ -122,11 +153,7 @@ def main():
     ap.add_argument("--shuffle", action="store_true", help="Shuffle packed blocks.")
     args = ap.parse_args()
 
-    accelerator = Accelerator(
-        gradient_accumulation_steps=args.grad_accum_steps,
-        mixed_precision="no",
-    )
-
+    accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum_steps)
     torch.manual_seed(args.seed)
 
     # --- tokenizer (only needed for saving + generation utils)
@@ -147,17 +174,13 @@ def main():
     config = AutoConfig.from_pretrained(args.model_dir, trust_remote_code=True)
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
 
-    model = model.to(torch.float32)
-
     # --- load packed parquet shards
-    packed = ParquetPackedIterable(
-        args.packed_dir, args.seq_len, args.shuffle, args.seed
-    )
+    packed = ParquetPackedDataset(args.packed_dir, args.seq_len)
 
     train_loader = DataLoader(
         packed,
         batch_size=args.micro_batch_size,
-        shuffle=False,  # MUST be False for IterableDataset
+        shuffle=args.shuffle,
         collate_fn=collate_packed,
         num_workers=args.num_workers,
         pin_memory=True,
@@ -169,8 +192,8 @@ def main():
         model.parameters(),
         lr=args.learning_rate,
         betas=(0.9, 0.95),
-        eps=1e-6,  # was 1e-8
-        weight_decay=0.0,  # TEMP test (add back later)
+        eps=1e-8,
+        weight_decay=args.weight_decay,
     )
 
     # --- scheduler
@@ -196,63 +219,17 @@ def main():
         except StopIteration:
             data_iter = iter(train_loader)
             batch = next(data_iter)
+
         with accelerator.accumulate(model):
-            outputs = model(**batch)
-            loss = outputs.loss
+            loss = model(**batch).loss
             accelerator.backward(loss)
 
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                if accelerator.is_main_process and step <= 50:
-                    unwrapped = accelerator.unwrap_model(model)
-                    badg = None
-                    for n, p in unwrapped.named_parameters():
-                        if p.grad is not None and not torch.isfinite(p.grad).all():
-                            badg = n
-                            break
-                    if badg is not None:
-                        print("Non-finite grad BEFORE step:", badg)
-                        raise RuntimeError(
-                            "Found non-finite gradient before optimizer.step()"
-                        )
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
 
-                if accelerator.is_main_process and step <= 16:
-                    unwrapped = accelerator.unwrap_model(model)
-                    bad = False
-                    for n, p in unwrapped.named_parameters():
-                        if p.requires_grad and not torch.isfinite(p).all():
-                            print("Non-finite param after opt step:", n)
-                            bad = True
-                            break
-                    if bad:
-                        raise RuntimeError(
-                            "Weights became non-finite right after optimizer step."
-                        )
-
-        if step == 1 and accelerator.is_main_process:
-            print(
-                "input_ids min/max:",
-                batch["input_ids"].min().item(),
-                batch["input_ids"].max().item(),
-            )
-            print(
-                "labels min/max:",
-                batch["labels"].min().item(),
-                batch["labels"].max().item(),
-            )
-            print(
-                "any NaN in input?",
-                torch.isnan(batch["input_ids"].float()).any().item(),
-            )
-            print(
-                "any NaN in labels?", torch.isnan(batch["labels"].float()).any().item()
-            )
-
-        if step == 1 and accelerator.is_main_process:
-            print("config.vocab_size:", model.config.vocab_size)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
 
         if accelerator.is_main_process and step % args.log_every == 0:
             lr = lr_scheduler.get_last_lr()[0]
