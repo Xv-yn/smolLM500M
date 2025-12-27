@@ -124,7 +124,7 @@ def main():
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.grad_accum_steps,
-        mixed_precision="bf16",
+        mixed_precision="no",
     )
 
     torch.manual_seed(args.seed)
@@ -203,6 +203,18 @@ def main():
 
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                if accelerator.is_main_process and step <= 50:
+                    unwrapped = accelerator.unwrap_model(model)
+                    badg = None
+                    for n, p in unwrapped.named_parameters():
+                        if p.grad is not None and not torch.isfinite(p.grad).all():
+                            badg = n
+                            break
+                    if badg is not None:
+                        print("Non-finite grad BEFORE step:", badg)
+                        raise RuntimeError(
+                            "Found non-finite gradient before optimizer.step()"
+                        )
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
