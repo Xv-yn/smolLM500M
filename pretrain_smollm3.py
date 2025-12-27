@@ -1,24 +1,28 @@
 """
-Usage (Parquet packed shards):
-
-accelerate launch --num_processes 2 pretrain_smollm3.py \
+accelerate launch --num_processes 1 pretrain_smollm3.py \
   --model_dir . \
   --packed_dir ./packed/seq4096 \
-  --output_dir ./runs/poc_packed \
+  --output_dir ./runs/full_20B_1epoch \
   --seq_len 4096 \
-  --micro_batch_size 1 \
-  --grad_accum_steps 8 \
-  --learning_rate 2e-4 \
-  --num_train_steps 2000 \
-  --warmup_steps 200 \
-  --save_every 500 \
-  --log_every 10
+  --micro_batch_size 4 \
+  --grad_accum_steps 2 \
+  --learning_rate 1e-4 \
+  --weight_decay 0.01 \
+  --num_train_steps 610352 \
+  --warmup_steps 2000 \
+  --log_every 10 \
+  --save_every 50000 \
+  --num_workers 0 \
+  --mixed_precision bf16 \
+  --attn_impl sdpa
+
 """
 
 import argparse
 import glob
 import os
 import random
+import time
 
 import pyarrow.parquet as pq
 import torch
@@ -85,11 +89,8 @@ class ParquetPackedIterable(IterableDataset):
                         continue
 
                     input_ids = torch.tensor(ids, dtype=torch.long)
-
-                    # Build attention_mask from pad_id (right or full padding OK)
                     attention_mask = (input_ids != self.pad_id).long()
 
-                    # Labels: ignore padding positions ONLY
                     labels = input_ids.clone()
                     labels[attention_mask == 0] = -100
 
@@ -117,16 +118,32 @@ def main():
     ap.add_argument("--grad_accum_steps", type=int, default=8)
     ap.add_argument("--learning_rate", type=float, default=2e-4)
     ap.add_argument("--weight_decay", type=float, default=0.1)
+
+    # IMPORTANT: now this means OPTIMIZER steps (weight updates)
     ap.add_argument("--num_train_steps", type=int, default=2000)
+
+    # warmup in OPTIMIZER steps too
     ap.add_argument("--warmup_steps", type=int, default=200)
-    ap.add_argument("--log_every", type=int, default=10)
-    ap.add_argument("--save_every", type=int, default=500)
+
+    ap.add_argument("--log_every", type=int, default=10)  # in OPT steps
+    ap.add_argument("--save_every", type=int, default=500)  # in OPT steps
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--shuffle", action="store_true")
+
     ap.add_argument(
-        "--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"]
+        "--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"]
     )
+    ap.add_argument(
+        "--attn_impl",
+        type=str,
+        default="sdpa",
+        choices=["auto", "sdpa", "flash_attention_2"],
+    )
+    ap.add_argument(
+        "--compile", action="store_true", help="torch.compile the model (PyTorch 2.x)"
+    )
+
     args = ap.parse_args()
 
     accelerator = Accelerator(
@@ -135,10 +152,14 @@ def main():
     )
     torch.manual_seed(args.seed)
 
+    # Speed knobs (safe)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     # --- tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
 
-    # IMPORTANT: ensure PAD is distinct from EOS to avoid "ignore all eos => empty loss"
+    # Ensure PAD is distinct from EOS (prevents empty-loss batches if you mask pad)
     if tokenizer.pad_token_id is None:
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
@@ -152,33 +173,38 @@ def main():
         print("tokenizer.pad_token_id:", pad_id)
         print("=================\n")
 
-        if eos_id is not None and pad_id == eos_id:
-            print(
-                "WARNING: pad_token_id == eos_token_id. This can cause NaN if you mask PAD in labels."
-            )
-            print(
-                "We attempted to add a real PAD token; if this still matches, your tokenizer may forbid it.\n"
-            )
-
     accelerator.wait_for_everyone()
 
     # --- model
     config = AutoConfig.from_pretrained(args.model_dir, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
 
-    # Make sure embeddings match tokenizer if we added PAD
+    model_kwargs = dict(trust_remote_code=True)
+    if args.attn_impl != "auto":
+        model_kwargs["attn_implementation"] = args.attn_impl
+
+    model = AutoModelForCausalLM.from_config(config, **model_kwargs)
+
+    # if we added PAD, resize embeddings
     if model.config.vocab_size != len(tokenizer):
         model.resize_token_embeddings(len(tokenizer))
+
+    # important for training speed/memory
+    model.config.use_cache = False
 
     if accelerator.is_main_process:
         print("model vocab_size:", model.config.vocab_size)
         print("tokenizer vocab_size:", len(tokenizer))
+        print("attn_impl:", args.attn_impl)
+        print("mixed_precision:", args.mixed_precision)
+
+    # Optional: torch.compile (can help, sometimes hurts)
+    if args.compile and hasattr(torch, "compile"):
+        model = torch.compile(model)
 
     # --- data
     packed = ParquetPackedIterable(
         args.packed_dir, args.seq_len, args.shuffle, args.seed, pad_id=pad_id
     )
-
     train_loader = DataLoader(
         packed,
         batch_size=args.micro_batch_size,
@@ -189,16 +215,23 @@ def main():
         persistent_workers=(args.num_workers > 0),
     )
 
-    # --- optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
+    # --- optimizer (fused if available)
+    adamw_kwargs = dict(
         lr=args.learning_rate,
         betas=(0.9, 0.95),
         eps=1e-6,
         weight_decay=args.weight_decay,
     )
+    try:
+        optimizer = torch.optim.AdamW(model.parameters(), fused=True, **adamw_kwargs)
+        if accelerator.is_main_process:
+            print("Using fused AdamW")
+    except TypeError:
+        optimizer = torch.optim.AdamW(model.parameters(), **adamw_kwargs)
+        if accelerator.is_main_process:
+            print("Using standard AdamW (fused not available)")
 
-    # --- scheduler
+    # --- scheduler (OPTIMIZER steps)
     lr_scheduler = get_scheduler(
         name="cosine",
         optimizer=optimizer,
@@ -213,16 +246,30 @@ def main():
     model.train()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # ---- training loop
     data_iter = iter(train_loader)
 
-    for step in range(1, args.num_train_steps + 1):
+    micro_step = 0
+    opt_step = 0
+
+    # logging for throughput
+    t0 = time.time()
+    last_log_t = t0
+    last_log_micro = 0
+
+    tokens_per_micro = args.micro_batch_size * args.seq_len
+    tokens_per_opt = tokens_per_micro * args.grad_accum_steps
+
+    while opt_step < args.num_train_steps:
         try:
             batch = next(data_iter)
         except StopIteration:
             data_iter = iter(train_loader)
             batch = next(data_iter)
 
-        # Guard 1: token id range sanity
+        micro_step += 1
+
+        # token id sanity
         vocab = model.config.vocab_size
         ids = batch["input_ids"]
         if (ids < 0).any() or (ids >= vocab).any():
@@ -230,26 +277,23 @@ def main():
                 print("vocab_size:", vocab)
                 print("min token:", ids.min().item())
                 print("max token:", ids.max().item())
-                bad = ids[(ids < 0) | (ids >= vocab)]
-                print("some bad ids:", bad[:20].tolist())
             raise RuntimeError("Found out-of-range token id")
 
-        # Guard 2: skip batches that have zero supervised tokens (all labels == -100)
+        # skip empty-supervision batches (all -100)
         if (batch["labels"] != -100).sum().item() == 0:
-            if accelerator.is_main_process and step % args.log_every == 0:
-                print(f"step {step:6d} | skipped batch (all labels ignored)")
             continue
 
         with accelerator.accumulate(model):
             outputs = model(**batch)
             loss = outputs.loss
 
-            # Guard 3: catch NaN early and print batch diagnostics
             if torch.isnan(loss) or torch.isinf(loss):
                 if accelerator.is_main_process:
                     am = batch["attention_mask"]
                     valid = (batch["labels"] != -100).sum().item()
-                    print(f"\nNaN/Inf loss at step {step}")
+                    print(
+                        f"\nNaN/Inf loss at micro_step {micro_step} opt_step {opt_step}"
+                    )
                     print("valid label tokens:", valid)
                     print("attention_mask sum:", am.sum().item(), "of", am.numel())
                     print("input_ids min/max:", ids.min().item(), ids.max().item())
@@ -262,18 +306,40 @@ def main():
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                opt_step += 1
 
-        if accelerator.is_main_process and step % args.log_every == 0:
-            lr = lr_scheduler.get_last_lr()[0]
-            print(f"step {step:6d} | loss {loss.item():.4f} | lr {lr:.6e}")
+                # log on OPT steps
+                if accelerator.is_main_process and (opt_step % args.log_every == 0):
+                    now = time.time()
+                    dt = now - last_log_t
+                    dmicro = micro_step - last_log_micro
+                    tok = dmicro * tokens_per_micro
+                    tps = tok / max(dt, 1e-9)
 
-        if accelerator.is_main_process and step % args.save_every == 0:
-            ckpt = os.path.join(args.output_dir, f"ckpt-step-{step}")
-            os.makedirs(ckpt, exist_ok=True)
-            unwrapped = accelerator.unwrap_model(model)
-            unwrapped.save_pretrained(ckpt, save_function=accelerator.save)
-            tokenizer.save_pretrained(ckpt)
-            print(f"Saved checkpoint: {ckpt}")
+                    lr = lr_scheduler.get_last_lr()[0]
+                    remaining = args.num_train_steps - opt_step
+                    eta_sec = remaining * (dt / max(args.log_every, 1e-9))
+                    eta_hr = eta_sec / 3600.0
+
+                    print(
+                        f"opt {opt_step:7d}/{args.num_train_steps} | "
+                        f"micro {micro_step:9d} | "
+                        f"loss {loss.item():.4f} | lr {lr:.3e} | "
+                        f"{tps:,.0f} tok/s | "
+                        f"ETA {eta_hr:.2f} h"
+                    )
+
+                    last_log_t = now
+                    last_log_micro = micro_step
+
+                # save on OPT steps
+                if accelerator.is_main_process and (opt_step % args.save_every == 0):
+                    ckpt = os.path.join(args.output_dir, f"ckpt-opt-{opt_step}")
+                    os.makedirs(ckpt, exist_ok=True)
+                    unwrapped = accelerator.unwrap_model(model)
+                    unwrapped.save_pretrained(ckpt, save_function=accelerator.save)
+                    tokenizer.save_pretrained(ckpt)
+                    print(f"Saved checkpoint: {ckpt}")
 
     if accelerator.is_main_process:
         final_dir = os.path.join(args.output_dir, "final")
