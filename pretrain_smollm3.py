@@ -113,7 +113,7 @@ def main():
     train_loader = DataLoader(
         packed,
         batch_size=args.micro_batch_size,
-        shuffle=True,
+        shuffle=False,
         collate_fn=collate_packed,
         num_workers=args.num_workers,
         pin_memory=True,
