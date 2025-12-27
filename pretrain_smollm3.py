@@ -20,12 +20,9 @@ Notes:
 """
 
 import argparse
-import bisect
 import glob
 import os
-from typing import List, Tuple
 
-import numpy as np
 import pyarrow.parquet as pq
 import torch
 from accelerate import Accelerator
@@ -37,12 +34,15 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 class ParquetPackedDataset(Dataset):
     """
-    Efficient reader for shard-*.parquet produced by build_packed_shards.py.
+    Reads shard-*.parquet produced by build_packed_shards.py.
 
-    Strategy:
-      - index row groups across all shards
-      - on __getitem__, locate (file, row_group, row_in_group)
-      - cache the decoded row group's input_ids in memory
+    Each row contains:
+      - input_ids: list[int] of length seq_len
+      - source: string (ignored for training)
+
+    We create:
+      - labels = input_ids (causal LM)
+      - attention_mask = ones
     """
 
     def __init__(self, packed_dir: str, seq_len: int, validate_first_n: int = 8):
@@ -56,40 +56,28 @@ class ParquetPackedDataset(Dataset):
                 "Point --packed_dir at the folder created by build_packed_shards.py."
             )
 
-        # Build an index over ALL row groups across ALL files.
-        # Each entry: (file_idx, row_group_idx, start_row_global, num_rows_in_group)
-        self._rg_index: List[Tuple[int, int, int, int]] = []
-        self._rg_starts: List[int] = []  # start_row_global for bisect
-        total_rows = 0
+        # Build a global row index: map [0..N) to (file_idx, row_idx)
+        self._file_row_counts = []
+        self._cum_rows = []
+        total = 0
+        for f in self.files:
+            pf = pq.ParquetFile(f)
+            n = pf.metadata.num_rows
+            self._file_row_counts.append(n)
+            total += n
+            self._cum_rows.append(total)
+        self._total_rows = total
 
-        self._pfiles = []  # ParquetFile objects (one per shard)
-        for fi, path in enumerate(self.files):
-            pf = pq.ParquetFile(path)
-            self._pfiles.append(pf)
-
-            for rgi in range(pf.num_row_groups):
-                rg_rows = pf.metadata.row_group(rgi).num_rows
-                self._rg_index.append((fi, rgi, total_rows, rg_rows))
-                self._rg_starts.append(total_rows)
-                total_rows += rg_rows
-
-        self._total_rows = total_rows
-
-        # Per-worker cache (each worker has its own Dataset instance)
-        self._cache_key = None  # (file_idx, row_group_idx)
-        self._cache_ids = None  # list[list[int]] or np array
-
-        # Quick sanity check: validate a few rows from the first row group
+        # Optional quick sanity check: validate a few rows from the first shard
+        # (fast fail if wrong seq_len)
         if validate_first_n > 0:
-            fi0, rg0, _, rg_rows0 = self._rg_index[0]
-            table = self._pfiles[fi0].read_row_group(rg0, columns=["input_ids"])
-            col = table["input_ids"]
-            ncheck = min(validate_first_n, rg_rows0)
+            table = pq.read_table(self.files[0], columns=["input_ids"])
+            ncheck = min(validate_first_n, table.num_rows)
             for i in range(ncheck):
-                ids = col[i].as_py()
+                ids = table["input_ids"][i].as_py()
                 if len(ids) != self.seq_len:
                     raise ValueError(
-                        f"Packed shard seq_len mismatch in {self.files[fi0]} row_group={rg0} row={i}. "
+                        f"Packed shard seq_len mismatch in {self.files[0]} row {i}. "
                         f"Expected {self.seq_len}, got {len(ids)}. "
                         "Launch with matching --seq_len or rebuild shards."
                     )
@@ -97,45 +85,28 @@ class ParquetPackedDataset(Dataset):
     def __len__(self):
         return self._total_rows
 
-    def _locate_row_group(self, idx: int):
-        # Find the row-group containing global row idx
-        rg_pos = bisect.bisect_right(self._rg_starts, idx) - 1
-        if rg_pos < 0:
-            rg_pos = 0
-        fi, rgi, start, nrows = self._rg_index[rg_pos]
-        row_in_group = idx - start
-        return rg_pos, fi, rgi, row_in_group
+    def _locate(self, idx: int):
+        # Find which file contains this global row index
+        import bisect
 
-    def _load_row_group_into_cache(self, fi: int, rgi: int):
-        table = self._pfiles[fi].read_row_group(rgi, columns=["input_ids"])
-        col = table["input_ids"]
-
-        # Materialize once. This is the expensive step, so we cache it.
-        # Keep as Python lists (fast enough) or convert to numpy object array.
-        # We'll keep Python lists for simplicity.
-        ids_list = [
-            col[i].as_py() for i in range(col.num_chunks and len(col) or table.num_rows)
-        ]
-        # NOTE: col may be ChunkedArray; easiest is iterate by table rows:
-        if len(ids_list) == 0:
-            # fallback safe path
-            ids_list = [table["input_ids"][i].as_py() for i in range(table.num_rows)]
-
-        self._cache_key = (fi, rgi)
-        self._cache_ids = ids_list
+        file_i = bisect.bisect_right(self._cum_rows, idx)
+        prev = 0 if file_i == 0 else self._cum_rows[file_i - 1]
+        row_i = idx - prev
+        return file_i, row_i
 
     def __getitem__(self, idx: int):
-        rg_pos, fi, rgi, row_in_group = self._locate_row_group(idx)
+        file_i, row_i = self._locate(idx)
+        f = self.files[file_i]
 
-        if self._cache_key != (fi, rgi):
-            self._load_row_group_into_cache(fi, rgi)
+        # NOTE: simplest correct approach: read the column and index the row.
+        # For smoke tests this is fine. For high throughput, optimize by caching
+        # row-groups or memory-mapping (can be done later).
+        table = pq.read_table(f, columns=["input_ids"])
+        ids = table["input_ids"][row_i].as_py()
 
-        ids = self._cache_ids[row_in_group]
-
-        # Safety check (can comment out once stable)
         if len(ids) != self.seq_len:
             raise ValueError(
-                f"Packed shard seq_len mismatch in {self.files[fi]} row_group={rgi} row={row_in_group}. "
+                f"Packed shard seq_len mismatch in {f} row {row_i}. "
                 f"Expected {self.seq_len}, got {len(ids)}."
             )
 
