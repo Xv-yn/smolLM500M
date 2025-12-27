@@ -1,11 +1,11 @@
 """
-Usage:
+Usage (Parquet packed shards):
 
 accelerate launch --num_processes 2 pretrain_smollm3.py \
   --model_dir . \
-  --packed_dir ./data/packed_seq2048 \
+  --packed_dir ./packed/seq4096 \
   --output_dir ./runs/poc_packed \
-  --seq_len 2048 \
+  --seq_len 4096 \
   --micro_batch_size 1 \
   --grad_accum_steps 8 \
   --learning_rate 2e-4 \
@@ -13,35 +13,119 @@ accelerate launch --num_processes 2 pretrain_smollm3.py \
   --warmup_steps 200 \
   --save_every 500 \
   --log_every 10
+
+Notes:
+- build_packed_shards.py writes shard-*.parquet (NOT datasets.save_to_disk()).
+- This script reads those parquet shards directly.
 """
 
 import argparse
+import glob
 import os
 
+import pyarrow.parquet as pq
 import torch
 from accelerate import Accelerator
-from datasets import load_from_disk
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-def collate_packed(examples):
+class ParquetPackedDataset(Dataset):
     """
-    Packed dataset is already fixed-length (seq_len). Just stack into tensors.
-    Supports datasets that either have attention_mask or not.
-    """
-    input_ids = torch.tensor([ex["input_ids"] for ex in examples], dtype=torch.long)
-    labels = torch.tensor([ex["labels"] for ex in examples], dtype=torch.long)
+    Reads shard-*.parquet produced by build_packed_shards.py.
 
-    if "attention_mask" in examples[0]:
-        attention_mask = torch.tensor(
-            [ex["attention_mask"] for ex in examples], dtype=torch.long
-        )
-    else:
+    Each row contains:
+      - input_ids: list[int] of length seq_len
+      - source: string (ignored for training)
+
+    We create:
+      - labels = input_ids (causal LM)
+      - attention_mask = ones
+    """
+
+    def __init__(self, packed_dir: str, seq_len: int, validate_first_n: int = 8):
+        self.packed_dir = packed_dir
+        self.seq_len = seq_len
+
+        self.files = sorted(glob.glob(os.path.join(packed_dir, "shard-*.parquet")))
+        if not self.files:
+            raise FileNotFoundError(
+                f"No shard-*.parquet found in {packed_dir}. "
+                "Point --packed_dir at the folder created by build_packed_shards.py."
+            )
+
+        # Build a global row index: map [0..N) to (file_idx, row_idx)
+        self._file_row_counts = []
+        self._cum_rows = []
+        total = 0
+        for f in self.files:
+            pf = pq.ParquetFile(f)
+            n = pf.metadata.num_rows
+            self._file_row_counts.append(n)
+            total += n
+            self._cum_rows.append(total)
+        self._total_rows = total
+
+        # Optional quick sanity check: validate a few rows from the first shard
+        # (fast fail if wrong seq_len)
+        if validate_first_n > 0:
+            table = pq.read_table(self.files[0], columns=["input_ids"])
+            ncheck = min(validate_first_n, table.num_rows)
+            for i in range(ncheck):
+                ids = table["input_ids"][i].as_py()
+                if len(ids) != self.seq_len:
+                    raise ValueError(
+                        f"Packed shard seq_len mismatch in {self.files[0]} row {i}. "
+                        f"Expected {self.seq_len}, got {len(ids)}. "
+                        "Launch with matching --seq_len or rebuild shards."
+                    )
+
+    def __len__(self):
+        return self._total_rows
+
+    def _locate(self, idx: int):
+        # Find which file contains this global row index
+        import bisect
+
+        file_i = bisect.bisect_right(self._cum_rows, idx)
+        prev = 0 if file_i == 0 else self._cum_rows[file_i - 1]
+        row_i = idx - prev
+        return file_i, row_i
+
+    def __getitem__(self, idx: int):
+        file_i, row_i = self._locate(idx)
+        f = self.files[file_i]
+
+        # NOTE: simplest correct approach: read the column and index the row.
+        # For smoke tests this is fine. For high throughput, optimize by caching
+        # row-groups or memory-mapping (can be done later).
+        table = pq.read_table(f, columns=["input_ids"])
+        ids = table["input_ids"][row_i].as_py()
+
+        if len(ids) != self.seq_len:
+            raise ValueError(
+                f"Packed shard seq_len mismatch in {f} row {row_i}. "
+                f"Expected {self.seq_len}, got {len(ids)}."
+            )
+
+        input_ids = torch.tensor(ids, dtype=torch.long)
+        labels = input_ids.clone()
         attention_mask = torch.ones_like(input_ids, dtype=torch.long)
 
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attention_mask,
+        }
+
+
+def collate_packed(examples):
+    # Examples already contain tensors of shape [seq_len]; just stack.
+    input_ids = torch.stack([ex["input_ids"] for ex in examples], dim=0)
+    labels = torch.stack([ex["labels"] for ex in examples], dim=0)
+    attention_mask = torch.stack([ex["attention_mask"] for ex in examples], dim=0)
     return {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
 
 
@@ -52,10 +136,10 @@ def main():
         "--packed_dir",
         type=str,
         required=True,
-        help="Path created by datasets.save_to_disk()",
+        help="Folder containing shard-*.parquet produced by build_packed_shards.py",
     )
     ap.add_argument("--output_dir", type=str, default="./outputs")
-    ap.add_argument("--seq_len", type=int, default=2048)
+    ap.add_argument("--seq_len", type=int, default=4096)
     ap.add_argument("--micro_batch_size", type=int, default=1)
     ap.add_argument("--grad_accum_steps", type=int, default=8)
     ap.add_argument("--learning_rate", type=float, default=2e-4)
@@ -66,6 +150,7 @@ def main():
     ap.add_argument("--save_every", type=int, default=500)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--num_workers", type=int, default=2)
+    ap.add_argument("--shuffle", action="store_true", help="Shuffle packed blocks.")
     args = ap.parse_args()
 
     accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum_steps)
@@ -89,31 +174,13 @@ def main():
     config = AutoConfig.from_pretrained(args.model_dir, trust_remote_code=True)
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
 
-    # --- load packed dataset
-    packed = load_from_disk(args.packed_dir)
-
-    # basic sanity checks (fail early with clear errors)
-    needed = {"input_ids", "labels"}
-    missing = needed - set(packed.column_names)
-    if missing:
-        raise ValueError(
-            f"Packed dataset missing columns: {missing}. Found: {packed.column_names}\n"
-            "Your packed builder should save fixed-length 'input_ids' and 'labels'."
-        )
-
-    # Optional: verify length of first example matches seq_len
-    ex0 = packed[0]
-    if len(ex0["input_ids"]) != args.seq_len or len(ex0["labels"]) != args.seq_len:
-        raise ValueError(
-            f"Packed dataset seq_len mismatch. "
-            f"Expected {args.seq_len}, got input_ids={len(ex0['input_ids'])}, labels={len(ex0['labels'])}.\n"
-            "Rebuild packed dataset with matching --seq_len."
-        )
+    # --- load packed parquet shards
+    packed = ParquetPackedDataset(args.packed_dir, args.seq_len)
 
     train_loader = DataLoader(
         packed,
         batch_size=args.micro_batch_size,
-        shuffle=False,
+        shuffle=args.shuffle,
         collate_fn=collate_packed,
         num_workers=args.num_workers,
         pin_memory=True,
