@@ -1,11 +1,11 @@
 """
-Usage:
+Usage (Parquet packed shards):
 
 accelerate launch --num_processes 2 pretrain_smollm3.py \
   --model_dir . \
-  --packed_dir ./data/packed_seq2048 \
+  --packed_dir ./packed/seq4096 \
   --output_dir ./runs/poc_packed \
-  --seq_len 2048 \
+  --seq_len 4096 \
   --micro_batch_size 1 \
   --grad_accum_steps 8 \
   --learning_rate 2e-4 \
@@ -13,35 +13,87 @@ accelerate launch --num_processes 2 pretrain_smollm3.py \
   --warmup_steps 200 \
   --save_every 500 \
   --log_every 10
+
+Notes:
+- build_packed_shards.py writes shard-*.parquet (NOT datasets.save_to_disk()).
+- This script reads those parquet shards directly.
 """
 
 import argparse
+import glob
 import os
 
+import pyarrow.parquet as pq
 import torch
 from accelerate import Accelerator
-from datasets import load_from_disk
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
+class ParquetPackedIterable(IterableDataset):
+    def __init__(self, packed_dir: str, seq_len: int, shuffle_shards: bool, seed: int):
+        super().__init__()
+        self.packed_dir = packed_dir
+        self.seq_len = seq_len
+        self.shuffle_shards = shuffle_shards
+        self.seed = seed
+
+        self.files = sorted(glob.glob(os.path.join(packed_dir, "shard-*.parquet")))
+        if not self.files:
+            raise FileNotFoundError(f"No shard-*.parquet in {packed_dir}")
+
+    def __iter__(self):
+        # DDP info (works with Accelerate too)
+        try:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+                world = dist.get_world_size()
+            else:
+                rank, world = 0, 1
+        except Exception:
+            rank, world = 0, 1
+
+        files = self.files[:]
+
+        # Cheap shuffle: shuffle shard order, not rows
+        if self.shuffle_shards:
+            rng = random.Random(self.seed + rank)
+            rng.shuffle(files)
+
+        # Split shards across ranks (rank 0 gets files 0, world, 2world...)
+        files = files[rank::world]
+
+        for path in files:
+            pf = pq.ParquetFile(path)
+
+            # Iterate row groups sequentially
+            for rg in range(pf.num_row_groups):
+                table = pf.read_row_group(rg, columns=["input_ids"])
+                col = table["input_ids"]
+
+                # Iterate rows sequentially
+                for i in range(table.num_rows):
+                    ids = col[i].as_py()
+                    if len(ids) != self.seq_len:
+                        continue
+
+                    input_ids = torch.tensor(ids, dtype=torch.long)
+                    yield {
+                        "input_ids": input_ids,
+                        "labels": input_ids,
+                        "attention_mask": torch.ones_like(input_ids),
+                    }
+
+
 def collate_packed(examples):
-    """
-    Packed dataset is already fixed-length (seq_len). Just stack into tensors.
-    Supports datasets that either have attention_mask or not.
-    """
-    input_ids = torch.tensor([ex["input_ids"] for ex in examples], dtype=torch.long)
-    labels = torch.tensor([ex["labels"] for ex in examples], dtype=torch.long)
-
-    if "attention_mask" in examples[0]:
-        attention_mask = torch.tensor(
-            [ex["attention_mask"] for ex in examples], dtype=torch.long
-        )
-    else:
-        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-
+    # Examples already contain tensors of shape [seq_len]; just stack.
+    input_ids = torch.stack([ex["input_ids"] for ex in examples], dim=0)
+    labels = torch.stack([ex["labels"] for ex in examples], dim=0)
+    attention_mask = torch.stack([ex["attention_mask"] for ex in examples], dim=0)
     return {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
 
 
@@ -52,10 +104,10 @@ def main():
         "--packed_dir",
         type=str,
         required=True,
-        help="Path created by datasets.save_to_disk()",
+        help="Folder containing shard-*.parquet produced by build_packed_shards.py",
     )
     ap.add_argument("--output_dir", type=str, default="./outputs")
-    ap.add_argument("--seq_len", type=int, default=2048)
+    ap.add_argument("--seq_len", type=int, default=4096)
     ap.add_argument("--micro_batch_size", type=int, default=1)
     ap.add_argument("--grad_accum_steps", type=int, default=8)
     ap.add_argument("--learning_rate", type=float, default=2e-4)
@@ -66,6 +118,7 @@ def main():
     ap.add_argument("--save_every", type=int, default=500)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--num_workers", type=int, default=2)
+    ap.add_argument("--shuffle", action="store_true", help="Shuffle packed blocks.")
     args = ap.parse_args()
 
     accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum_steps)
@@ -89,31 +142,15 @@ def main():
     config = AutoConfig.from_pretrained(args.model_dir, trust_remote_code=True)
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
 
-    # --- load packed dataset
-    packed = load_from_disk(args.packed_dir)
-
-    # basic sanity checks (fail early with clear errors)
-    needed = {"input_ids", "labels"}
-    missing = needed - set(packed.column_names)
-    if missing:
-        raise ValueError(
-            f"Packed dataset missing columns: {missing}. Found: {packed.column_names}\n"
-            "Your packed builder should save fixed-length 'input_ids' and 'labels'."
-        )
-
-    # Optional: verify length of first example matches seq_len
-    ex0 = packed[0]
-    if len(ex0["input_ids"]) != args.seq_len or len(ex0["labels"]) != args.seq_len:
-        raise ValueError(
-            f"Packed dataset seq_len mismatch. "
-            f"Expected {args.seq_len}, got input_ids={len(ex0['input_ids'])}, labels={len(ex0['labels'])}.\n"
-            "Rebuild packed dataset with matching --seq_len."
-        )
+    # --- load packed parquet shards
+    packed = ParquetPackedIterable(
+        args.packed_dir, args.seq_len, args.shuffle, args.seed
+    )
 
     train_loader = DataLoader(
         packed,
         batch_size=args.micro_batch_size,
-        shuffle=False,
+        shuffle=False,  # MUST be False for IterableDataset
         collate_fn=collate_packed,
         num_workers=args.num_workers,
         pin_memory=True,
